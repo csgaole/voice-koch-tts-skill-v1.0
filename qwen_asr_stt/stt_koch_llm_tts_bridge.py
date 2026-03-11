@@ -89,7 +89,6 @@ def main() -> int:
             timeout=args.llm_timeout,
         )
         print(f"[LLM] {json.dumps(llm_result, ensure_ascii=False)}")
-        maybe_speak(llm_result.get("reply", ""), args)
 
         if not llm_result["execute"]:
             print(f"[INFO] LLM declined execution: {llm_result.get('reason', '')}", file=sys.stderr)
@@ -110,7 +109,10 @@ def main() -> int:
             )
 
         if args.dry_run:
+            maybe_speak(llm_result.get("reply", ""), args)
             return 0
+
+        maybe_speak(llm_result.get("reply", ""), args)
 
         if llm_result["action"] == "custom_sequence":
             payload = {

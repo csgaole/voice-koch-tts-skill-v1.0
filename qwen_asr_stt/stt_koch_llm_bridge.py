@@ -17,7 +17,7 @@ from stt_qwen_mic import check_arecord, prepare_output_path, record_audio
 
 OPENCLAW_CONFIG = Path(__file__).resolve().parents[1] / ".openclaw" / "openclaw0309.json"
 DEFAULT_KIMI_BASE_URL = "https://api.moonshot.cn/v1"
-DEFAULT_KIMI_MODEL = "moonshot/kimi-k2.5"
+DEFAULT_KIMI_MODEL = "kimi-k2.5"
 DEFAULT_KIMI_FALLBACK_MODEL = "moonshot-v1-8k"
 SUPPORTED_ACTIONS = {"home", "ready", "dance", "status", "power_down", "custom_sequence"}
 ACTION_TO_KOCH_COMMAND = {

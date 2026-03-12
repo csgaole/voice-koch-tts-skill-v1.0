@@ -23,6 +23,6 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 export KIMI_LLM_BASE_URL="${KIMI_LLM_BASE_URL:-${MOONSHOT_BASE_URL:-https://api.moonshot.cn/v1}}"
-export KIMI_LLM_MODEL="${KIMI_LLM_MODEL:-${MOONSHOT_MODEL:-moonshot/kimi-k2.5}}"
+export KIMI_LLM_MODEL="${KIMI_LLM_MODEL:-${MOONSHOT_MODEL:-kimi-k2.5}}"
 
 exec "$VENV_PY" "$SCRIPT" "$@"

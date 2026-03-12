@@ -392,6 +392,38 @@ few-shot 示例 8：抓一下再松开
 }
 """
 
+KIMI_SEMANTIC_PROMPT = """你是 Koch 机械臂的语义动作解析器。
+
+你的任务是把用户中文指令解析成一个简短 JSON 对象。
+不要生成关节值，不要生成代码，不要解释。
+
+如果用户不是在控制机械臂，输出：
+{"execute": false, "reason": "...", "reply": "...", "actions": []}
+
+如果用户在控制机械臂，输出：
+{"execute": true, "reason": "...", "reply": "...", "actions": [...]}
+
+actions 只允许这些动作名：
+- preset: 预设动作，preset 只能是 home / ready / dance / status / power_down
+- raise: 抬手
+- wave: 摆手，允许 count
+- nod: 点头，允许 count
+- grip: 夹爪动作，mode 只能是 open_close
+- highest: 升到最高
+
+示例 1：
+{"execute": true, "reason": "用户要求抬手并摆手。", "reply": "执行抬手摆手动作。", "actions": [{"name": "raise"}, {"name": "wave", "count": 5}]}
+
+示例 2：
+{"execute": true, "reason": "用户要求抬手并点头。", "reply": "执行抬手点头动作。", "actions": [{"name": "raise"}, {"name": "nod", "count": 3}]}
+
+示例 3：
+{"execute": true, "reason": "用户要求回 home。", "reply": "回到 home 位置。", "actions": [{"name": "preset", "preset": "home"}]}
+
+示例 4：
+{"execute": false, "reason": "用户在聊汽车，不是机械臂控制。", "reply": "这个问题和机械臂无关。", "actions": []}
+"""
+
 
 def load_openclaw_defaults() -> dict[str, str | None]:
     defaults: dict[str, str | None] = {
@@ -502,6 +534,13 @@ def temperature_for_model(model: str) -> float | int:
     if normalized == "kimi-k2.5":
         return 1
     return 0
+
+
+def system_prompt_for_model(model: str) -> str:
+    normalized = (model or "").strip().lower()
+    if normalized == "kimi-k2.5":
+        return KIMI_SEMANTIC_PROMPT
+    return SYSTEM_PROMPT
 
 
 def should_retry_with_fallback_model(error: Exception, model: str, fallback_model: str | None) -> bool:
@@ -689,6 +728,9 @@ def validate_llm_result(result: dict) -> dict:
     if not isinstance(result, dict):
         raise RuntimeError("LLM result must be a JSON object.")
 
+    if "actions" in result and "action" not in result:
+        return validate_semantic_action_result(result)
+
     execute = bool(result.get("execute", False))
     raw_action = result.get("action")
     action = "" if raw_action is None else str(raw_action).strip()
@@ -758,6 +800,174 @@ def validate_llm_result(result: dict) -> dict:
     }
 
 
+def _prep_raise_step() -> dict:
+    return {
+        "targets": {
+            "shoulder_lift": 1960,
+            "elbow_flex": 2200,
+            "wrist_flex": 2680,
+            "gripper": 2380,
+        },
+        "duration": 1.0,
+        "pause": 0.15,
+    }
+
+
+def _highest_step_sequence() -> list[dict]:
+    return [
+        {
+            "targets": {
+                "shoulder_pan": 2050,
+                "shoulder_lift": 1980,
+                "elbow_flex": 2250,
+                "wrist_flex": 2550,
+                "gripper": 2350,
+            },
+            "duration": 1.0,
+            "pause": 0.15,
+        },
+        {
+            "targets": {
+                "shoulder_lift": 2100,
+                "elbow_flex": 2100,
+                "wrist_flex": 2620,
+            },
+            "duration": 0.9,
+            "pause": 0.0,
+        },
+    ]
+
+
+def _wave_steps(count: int) -> list[dict]:
+    steps: list[dict] = []
+    for index in range(count):
+        steps.append({"targets": {"shoulder_pan": 2280}, "duration": 0.6, "pause": 0.1})
+        steps.append(
+            {
+                "targets": {"shoulder_pan": 1800},
+                "duration": 0.6,
+                "pause": 0.0 if index == count - 1 else 0.1,
+            }
+        )
+    return steps
+
+
+def _nod_steps(count: int) -> list[dict]:
+    steps: list[dict] = []
+    for index in range(count):
+        steps.append({"targets": {"wrist_flex": 2400}, "duration": 0.45, "pause": 0.1})
+        steps.append(
+            {
+                "targets": {"wrist_flex": 2800},
+                "duration": 0.45,
+                "pause": 0.0 if index == count - 1 else 0.1,
+            }
+        )
+    return steps
+
+
+def _grip_open_close_steps() -> list[dict]:
+    return [
+        {
+            "targets": {
+                "shoulder_lift": 2000,
+                "elbow_flex": 2240,
+                "wrist_flex": 2620,
+                "gripper": 2550,
+            },
+            "duration": 0.8,
+            "pause": 0.15,
+        },
+        {"targets": {"gripper": 2200}, "duration": 0.6, "pause": 0.15},
+        {"targets": {"gripper": 2550}, "duration": 0.6, "pause": 0.0},
+    ]
+
+
+def validate_semantic_action_result(result: dict) -> dict:
+    execute = bool(result.get("execute", False))
+    reason = str(result.get("reason", "")).strip()
+    reply = str(result.get("reply", "")).strip()
+    actions = result.get("actions", [])
+
+    try:
+        confidence = float(result.get("confidence", 0.9 if execute else 0.0))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("LLM confidence must be numeric.") from exc
+
+    if not execute:
+        return {
+            "execute": False,
+            "action": "",
+            "confidence": max(0.0, min(1.0, confidence)),
+            "reason": reason,
+            "reply": reply,
+            "sequence": [],
+            "return_to_home": False,
+        }
+
+    if not isinstance(actions, list) or not actions:
+        raise RuntimeError("Semantic actions result requires a non-empty actions list.")
+
+    if len(actions) == 1 and isinstance(actions[0], dict) and str(actions[0].get("name", "")).strip() == "preset":
+        preset = str(actions[0].get("preset", "")).strip()
+        if preset not in SUPPORTED_ACTIONS - {"custom_sequence"}:
+            raise RuntimeError(f"Unsupported semantic preset: {preset}")
+        return {
+            "execute": True,
+            "action": preset,
+            "confidence": max(0.0, min(1.0, confidence)),
+            "reason": reason,
+            "reply": reply,
+            "sequence": [],
+            "return_to_home": False,
+        }
+
+    sequence: list[dict] = []
+    raised = False
+    for raw_action in actions:
+        if not isinstance(raw_action, dict):
+            raise RuntimeError("Each semantic action must be an object.")
+        name = str(raw_action.get("name", "")).strip()
+        if name == "raise":
+            if not raised:
+                sequence.append(_prep_raise_step())
+                raised = True
+        elif name == "highest":
+            sequence.extend(_highest_step_sequence())
+            raised = True
+        elif name == "wave":
+            count = max(1, min(int(raw_action.get("count", 2)), 6))
+            if not raised:
+                sequence.append(_prep_raise_step())
+                raised = True
+            sequence.extend(_wave_steps(count))
+        elif name == "nod":
+            count = max(1, min(int(raw_action.get("count", 2)), 6))
+            if not raised:
+                sequence.append(_prep_raise_step())
+                raised = True
+            sequence.extend(_nod_steps(count))
+        elif name == "grip":
+            mode = str(raw_action.get("mode", "open_close")).strip()
+            if mode != "open_close":
+                raise RuntimeError(f"Unsupported grip mode: {mode}")
+            sequence.extend(_grip_open_close_steps())
+        elif name == "preset":
+            raise RuntimeError("preset must be the only action when using semantic actions.")
+        else:
+            raise RuntimeError(f"Unsupported semantic action: {name}")
+
+    return {
+        "execute": True,
+        "action": "custom_sequence",
+        "confidence": max(0.0, min(1.0, confidence)),
+        "reason": reason,
+        "reply": reply,
+        "sequence": sequence,
+        "return_to_home": False,
+    }
+
+
 CHINESE_NUMBER_MAP = {
     "零": 0,
     "一": 1,
@@ -772,6 +982,25 @@ CHINESE_NUMBER_MAP = {
     "九": 9,
     "十": 10,
 }
+
+
+def interpret_robot_intent(
+    user_text: str,
+    base_url: str,
+    api_key: str,
+    model: str,
+    timeout: int,
+    fallback_model: str | None = None,
+) -> dict:
+    """Layer 1: ask the LLM for semantic robot intent only."""
+    return call_llm(
+        user_text=user_text,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        timeout=timeout,
+        fallback_model=fallback_model,
+    )
 
 
 def parse_count_token(token: str) -> int | None:
@@ -794,7 +1023,17 @@ def parse_count_token(token: str) -> int | None:
 
 
 def extract_requested_swing_count(user_text: str) -> int | None:
-    match = re.search(r"(?:摆动|摆摆手|摆手|摇动|摇摆|挥动|挥手)([零一二两三四五六七八九十\d]+)下", user_text)
+    match = re.search(r"(?:摆动|摆摆手|摆手|摆|摇动|摇摆|挥动|挥手|挥)([零一二两三四五六七八九十\d]+)下", user_text)
+    if not match:
+        return None
+    count = parse_count_token(match.group(1))
+    if count is None:
+        return None
+    return max(1, min(count, 6))
+
+
+def extract_requested_nod_count(user_text: str) -> int | None:
+    match = re.search(r"(?:点头|点)([零一二两三四五六七八九十\d]+)下", user_text)
     if not match:
         return None
     count = parse_count_token(match.group(1))
@@ -855,6 +1094,98 @@ def enforce_swing_count_if_needed(user_text: str, llm_result: dict) -> dict:
     return updated
 
 
+def enforce_nod_count_if_needed(user_text: str, llm_result: dict) -> dict:
+    if llm_result.get("action") != "custom_sequence":
+        return llm_result
+
+    requested_count = extract_requested_nod_count(user_text)
+    if not requested_count:
+        return llm_result
+
+    sequence = llm_result.get("sequence", [])
+    if len(sequence) < 2:
+        return llm_result
+
+    nod_steps = [step for step in sequence if "wrist_flex" in step.get("targets", {})]
+    if len(nod_steps) < 2:
+        return llm_result
+
+    nod_values = [step["targets"]["wrist_flex"] for step in nod_steps]
+    low = min(nod_values)
+    high = max(nod_values)
+    if low == high:
+        return llm_result
+
+    prep_step = dict(sequence[0])
+    prep_targets = dict(prep_step.get("targets", {}))
+    prep_targets.pop("wrist_flex", None)
+    prep_step["targets"] = prep_targets
+
+    base_duration = nod_steps[0].get("duration", 0.45)
+    base_pause = nod_steps[0].get("pause", 0.1)
+
+    normalized_sequence = [prep_step]
+    for index in range(requested_count):
+        normalized_sequence.append(
+            {
+                "targets": {"wrist_flex": low},
+                "duration": base_duration,
+                "pause": base_pause,
+            }
+        )
+        normalized_sequence.append(
+            {
+                "targets": {"wrist_flex": high},
+                "duration": base_duration,
+                "pause": 0.0 if index == requested_count - 1 else base_pause,
+            }
+        )
+
+    updated = dict(llm_result)
+    updated["sequence"] = normalized_sequence
+    return updated
+
+
+def apply_robot_rules(user_text: str, llm_result: dict) -> dict:
+    """Layer 2: apply deterministic local rules to the semantic plan."""
+    adjusted = dict(llm_result)
+    adjusted = enforce_swing_count_if_needed(user_text, adjusted)
+    adjusted = enforce_nod_count_if_needed(user_text, adjusted)
+    return adjusted
+
+
+def build_robot_execution_payload(llm_result: dict) -> tuple[str, str | dict]:
+    """Layer 3 input: translate the rule-adjusted plan into a koch executor payload."""
+    if llm_result["action"] == "custom_sequence":
+        return (
+            "payload",
+            {
+                "action": "custom_sequence",
+                "sequence": llm_result["sequence"],
+                "hold_position": False,
+                "return_to_home": True,
+                "power_down_after": True,
+            },
+        )
+    return ("command", ACTION_TO_KOCH_COMMAND[llm_result["action"]])
+
+
+def execute_robot_plan(llm_result: dict) -> bool:
+    """Layer 3: execute the safe plan through koch-skill only."""
+    execution_kind, execution_value = build_robot_execution_payload(llm_result)
+    if execution_kind == "payload":
+        assert isinstance(execution_value, dict)
+        print(
+            f"[INFO] Sending custom sequence to koch-skill: {json.dumps(execution_value, ensure_ascii=False)}",
+            file=sys.stderr,
+        )
+        return execute_koch_payload(execution_value)
+
+    assert isinstance(execution_value, str)
+    print(f"[INFO] Sending to koch-skill: {shlex.quote(execution_value)}", file=sys.stderr)
+    return execute_koch_command(execution_value)
+
+
 def call_llm(
     user_text: str,
     base_url: str,
@@ -875,9 +1206,9 @@ def call_llm(
         payload = {
             "model": model_name,
             "temperature": temperature_for_model(model_name),
-            "max_tokens": 600,
+            "max_tokens": 1200 if (model_name or "").strip().lower() == "kimi-k2.5" else 600,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt_for_model(model_name)},
                 {"role": "user", "content": f"ASR 转写文本：{user_text}"},
             ],
         }
@@ -982,7 +1313,7 @@ def main() -> int:
             f"[INFO] Calling LLM {args.llm_model} via {normalize_base_url(args.llm_base_url or '')}",
             file=sys.stderr,
         )
-        llm_result = call_llm(
+        semantic_result = interpret_robot_intent(
             user_text=text,
             base_url=args.llm_base_url,
             api_key=args.llm_api_key,
@@ -990,7 +1321,7 @@ def main() -> int:
             timeout=args.llm_timeout,
             fallback_model=args.llm_fallback_model,
         )
-        llm_result = enforce_swing_count_if_needed(text, llm_result)
+        llm_result = apply_robot_rules(text, semantic_result)
         print(f"[LLM] {json.dumps(llm_result, ensure_ascii=False)}")
 
         if not llm_result["execute"]:
@@ -1004,23 +1335,7 @@ def main() -> int:
         if args.dry_run:
             return 0
 
-        if llm_result["action"] == "custom_sequence":
-            payload = {
-                "action": "custom_sequence",
-                "sequence": llm_result["sequence"],
-                "hold_position": False,
-                "return_to_home": True,
-                "power_down_after": True,
-            }
-            print(
-                f"[INFO] Sending custom sequence to koch-skill: {json.dumps(payload, ensure_ascii=False)}",
-                file=sys.stderr,
-            )
-            ok = execute_koch_payload(payload)
-        else:
-            koch_command = ACTION_TO_KOCH_COMMAND[llm_result["action"]]
-            print(f"[INFO] Sending to koch-skill: {shlex.quote(koch_command)}", file=sys.stderr)
-            ok = execute_koch_command(koch_command)
+        ok = execute_robot_plan(llm_result)
 
         if not ok:
             fail("koch-skill rejected or failed to execute the LLM action.")

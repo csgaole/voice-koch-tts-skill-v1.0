@@ -16,6 +16,8 @@ from stt_qwen_mic import check_arecord, prepare_output_path, record_audio
 
 
 OPENCLAW_CONFIG = Path(__file__).resolve().parents[1] / ".openclaw" / "openclaw0309.json"
+DEFAULT_KIMI_BASE_URL = "https://api.moonshot.cn/v1"
+DEFAULT_KIMI_MODEL = "moonshot/kimi-k2.5"
 SUPPORTED_ACTIONS = {"home", "ready", "dance", "status", "power_down", "custom_sequence"}
 ACTION_TO_KOCH_COMMAND = {
     "home": "home",
@@ -392,9 +394,26 @@ few-shot 示例 8：抓一下再松开
 
 def load_openclaw_defaults() -> dict[str, str | None]:
     defaults: dict[str, str | None] = {
-        "base_url": os.getenv("QWEN_LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL"),
-        "api_key": os.getenv("QWEN_LLM_API_KEY") or os.getenv("OPENAI_API_KEY"),
-        "model": os.getenv("QWEN_LLM_MODEL") or os.getenv("OPENAI_MODEL"),
+        "base_url": (
+            os.getenv("KIMI_LLM_BASE_URL")
+            or os.getenv("MOONSHOT_BASE_URL")
+            or os.getenv("QWEN_LLM_BASE_URL")
+            or os.getenv("OPENAI_BASE_URL")
+            or DEFAULT_KIMI_BASE_URL
+        ),
+        "api_key": (
+            os.getenv("KIMI_API_KEY")
+            or os.getenv("MOONSHOT_API_KEY")
+            or os.getenv("QWEN_LLM_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+        ),
+        "model": (
+            os.getenv("KIMI_LLM_MODEL")
+            or os.getenv("MOONSHOT_MODEL")
+            or os.getenv("QWEN_LLM_MODEL")
+            or os.getenv("OPENAI_MODEL")
+            or DEFAULT_KIMI_MODEL
+        ),
     }
 
     if not OPENCLAW_CONFIG.exists():
@@ -445,8 +464,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--llm-model",
-        default=llm_defaults["model"] or "qwen3.5-plus",
-        help="LLM model id. Default: qwen3.5-plus",
+        default=llm_defaults["model"] or DEFAULT_KIMI_MODEL,
+        help=f"LLM model id. Default: {DEFAULT_KIMI_MODEL}",
     )
     parser.add_argument(
         "--llm-api-key",

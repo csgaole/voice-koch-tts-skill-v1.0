@@ -92,13 +92,14 @@ def main() -> int:
 
         if not llm_result["execute"]:
             print(f"[INFO] LLM declined execution: {llm_result.get('reason', '')}", file=sys.stderr)
+            print("[INFO] Generating spoken assistant reply without robot execution...", file=sys.stderr)
             try:
                 assistant_reply = post_chat_reply(
                     user_text=text,
                     base_url=args.llm_base_url,
                     api_key=args.llm_api_key,
                     model=args.llm_model,
-                    timeout=args.llm_timeout,
+                    timeout=min(args.llm_timeout, 20),
                 )
             except Exception as exc:
                 print(f"[WARN] Assistant reply fallback triggered: {exc}", file=sys.stderr)

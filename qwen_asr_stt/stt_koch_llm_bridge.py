@@ -516,6 +516,18 @@ def should_retry_with_fallback_model(error: Exception, model: str, fallback_mode
     )
 
 
+def should_retry_parse_failure_with_fallback(error: Exception, model: str, fallback_model: str | None) -> bool:
+    if not fallback_model or fallback_model == model:
+        return False
+    message = str(error)
+    return (
+        "LLM returned an incomplete JSON object" in message
+        or "LLM returned malformed JSON and repair also failed" in message
+        or "LLM returned empty content during JSON repair" in message
+        or "Unable to parse LLM JSON" in message
+    )
+
+
 def strip_markdown_fences(text: str) -> str:
     stripped = text.strip()
     if stripped.startswith("```"):
@@ -919,6 +931,13 @@ def call_llm(
             )
             return validate_llm_result(repaired)
         except Exception as second_error:
+            if should_retry_parse_failure_with_fallback(second_error, model=active_model, fallback_model=fallback_model):
+                print(
+                    f"[WARN] LLM model {active_model} produced unusable JSON; retrying with fallback model {fallback_model}",
+                    file=sys.stderr,
+                )
+                fallback_content = request_once(fallback_model)
+                return validate_llm_result(parse_json_object(fallback_content))
             raise RuntimeError(
                 "LLM returned malformed JSON and repair also failed.\n"
                 f"Original content:\n{content}"
